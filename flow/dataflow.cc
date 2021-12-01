@@ -5,114 +5,128 @@
 
 #include <list>
 
-char datautils::DataWorker::ID = 0;
+llvm::AnalysisKey datautils::DataWorker::Key;
 
-static llvm::RegisterPass<datautils::DataWorker> X("dot-dataflow", "Print data flow graph to a dotfile");
 
-datautils::DataWorker::DataWorker() : llvm::ModulePass(ID){}
+unsigned int datautils::DataWorker::num = 0;
 
-std::string datautils::getvaluestaticname(llvm::Value* val)
+llvm::PreservedAnalyses datautils::DataWorker::run(llvm::Module& M, llvm::ModuleAnalysisManager &MAM){
+	return runOnModule(M);
+}
+
+llvm::PreservedAnalyses datautils::DataWorker::runOnModule(llvm::Module& M){
+	for (auto &gVar : M.getGlobalList()){
+		globals.push_back(node(
+					llvm::dyn_cast<llvm::Value>(gVar.stripPointerCasts()),
+				 	gVar.getName())
+				);
+	}
+
+	for (auto &F: M){
+			for (auto &B: F){
+				for (auto &I: B){
+					switch (I.getOpcode()){
+					case llvm::Instruction::Call:
+						{
+							llvm::CallInst * callinst = llvm::dyn_cast<llvm::CallInst>(I.stripPointerCasts());
+							llvm::Function * func = callinst->getCalledFunction();
+              func_calls[I.stripPointerCasts()]= func;
+							llvm::errs() << func->getName() << "\n";
+							for (auto &arg: func->args()){
+								func_args[func].push_back(node(arg.stripPointerCasts(), datautils::getValStaticName(arg.stripPointerCasts())));
+								data_flow_edges.push_back(edge(
+											node(I.stripPointerCasts(),
+											 	datautils::getValStaticName(I.stripPointerCasts())),
+										 	node(arg.stripPointerCasts(),
+											 	datautils::getValStaticName(arg.stripPointerCasts())))
+										);
+								// ///TODO:Use iterations over the arguments of the functions
+								// for(llvm::Value::use_iterator UI = arg_idx->use_begin(), UE = arg_idx->use_end(); UI != UE; ++UI)
+								// {
+
+								//     data_flow_edges.push_back(edge(node(arg_idx, datautils::getvaluestaticname(arg_idx)), node(UI->get(), datautils::getvaluestaticname(UI->get()))));
+								// }
+							}
+						}
+						break;
+					case llvm::Instruction::Store:
+						{
+							llvm::StoreInst* storeinst = llvm::dyn_cast<llvm::StoreInst>(I.stripPointerCasts());
+							llvm::Value* storeValPtr = storeinst->getPointerOperand();
+							llvm::Value* storeval    = storeinst->getValueOperand();
+							data_flow_edges.push_back(edge(
+										node(I.stripPointerCasts(), datautils::getValStaticName(I.stripPointerCasts())),
+									 	node(storeValPtr, datautils::getValStaticName(storeValPtr))));
+							data_flow_edges.push_back(edge(
+										node(storeval, datautils::getValStaticName(storeval)),
+									 	node(I.stripPointerCasts(), datautils::getValStaticName(I.stripPointerCasts()))));
+						}
+						break;
+					case llvm::Instruction::Load:
+						{
+								llvm::LoadInst* loadinst = llvm::dyn_cast<llvm::LoadInst>(I.stripPointerCasts());
+								llvm::Value* loadvalptr = loadinst->getPointerOperand();
+								data_flow_edges.push_back(
+										edge(
+											node(loadvalptr,
+											 	datautils::getValStaticName(loadvalptr)),
+										 	node(I.stripPointerCasts(),
+											 	datautils::getValStaticName(loadvalptr))));
+						}break;
+					default :
+            {
+                for(auto &op : I.operands()){
+                    if(llvm::dyn_cast<llvm::Instruction>(op->stripPointerCasts()) || 
+												llvm::dyn_cast<llvm::Argument>(op->stripPointerCasts()))
+												data_flow_edges.push_back(
+														edge(
+															node(op.get(),
+															 	datautils::getValStaticName(op.get())),
+														 	node(I.stripPointerCasts(),
+															 	datautils::getValStaticName(I.stripPointerCasts()))));
+								}
+						}break;
+				}
+				auto next = I.getNextNode();
+        func_nodes_ctrl[&F].push_back(
+						node(I.stripPointerCasts(),
+						 	datautils::getValStaticName(I.stripPointerCasts())));
+				if (next != nullptr){
+					func_edges_ctrl[&F].push_back(edge(
+								node(I.stripPointerCasts(), datautils::getValStaticName(I.stripPointerCasts())),
+								node(next->stripPointerCasts(), datautils::getValStaticName(next->stripPointerCasts()))
+								));
+				}
+			}
+			auto TI = B.getTerminator();
+			for(unsigned int succ_idx  = 0, succ_num = TI->getNumSuccessors(); succ_idx != succ_num; ++succ_idx)
+			{
+					llvm::BasicBlock * Succ = TI->getSuccessor(succ_idx);
+					llvm::Value* succ_inst = Succ->begin()->stripPointerCasts();
+					func_edges_ctrl[&F].push_back(
+							edge(
+								node(
+									TI, datautils::getValStaticName(TI)), 
+								node(succ_inst, datautils::getValStaticName(succ_inst)))
+							);
+			}
+		}
+	}
+	std::ofstream outgraphfile("ctrl-data.dot");
+  dumpCompleteDiGraph(outgraphfile);
+  return llvm::PreservedAnalyses::all();
+}
+
+std::string datautils::getValStaticName(llvm::Value* val)
 {
     std::string ret_val = "val";
-    if(val->getName().empty()) {ret_val += std::to_string(num);num++;}
+    if(val->getName().empty()) {ret_val += std::to_string(DataWorker::num);DataWorker::num++;}
     else ret_val = val->getName().str();
 
     if(llvm::isa<llvm::Instruction>(val))ret_val += ":"+llvmutils::LLVMInstructionAsString(llvm::dyn_cast<llvm::Instruction>(val));
 
     return ret_val;
 }
-
-bool datautils::DataWorker::runOnModule(llvm::Module &M){/*{{{*/
-    ///TODO: create the graph data structure and then dump it.
-    //
-    ///UPDATE: use existing library such as cgraph
-    ///This shit is complicated to debug. Those missing nodes labels are a headache.
-    for(auto globalVariableIdx = M.getGlobalList().begin(),
-            globalVariableEnd = M.getGlobalList().end();
-            globalVariableIdx != globalVariableEnd;
-            ++globalVariableIdx)
-    {
-        //llvm::errs() << *globalVariableIdx << "\n";
-        globals.push_back(node(&*globalVariableIdx,globalVariableIdx->getName().str()));
-
-    }
-
-    for(auto FI = M.getFunctionList().begin(), FE = M.getFunctionList().end(); FI != FE; ++FI)
-    {
-        //TODO:Get a function wise list so the operands defined in the function make sense when
-        //use in store instructions. else in the graph they appear outof nowhere.
-
-        for(auto BB = FI->getBasicBlockList().begin(), BE = FI->getBasicBlockList().end(); BB != BE; ++BB)
-        {
-            for(auto II = BB->begin(), IE = BB->end(); II != IE; ++II)
-            {
-                switch(II->getOpcode()){
-                    case llvm::Instruction::Call:
-                        {
-                            llvm::CallInst * callinst = llvm::dyn_cast<llvm::CallInst>(II);
-                            llvm::Function * func = callinst->getCalledFunction();
-                            func_calls[&*II]= func;
-                            for(auto arg_idx = func->arg_begin(), arg_end = func->arg_end();arg_idx != arg_end; ++arg_idx)
-                            {
-                                func_args[func].push_back(node(&*arg_idx, datautils::getvaluestaticname(&*arg_idx)));
-                                data_flow_edges.push_back(edge(node(&*II, datautils::getvaluestaticname(&*II)), node(&*arg_idx, datautils::getvaluestaticname(&*arg_idx))));
-                                // ///TODO:Use iterations over the arguments of the functions
-                                // for(llvm::Value::use_iterator UI = arg_idx->use_begin(), UE = arg_idx->use_end(); UI != UE; ++UI)
-                                // {
-
-                                //     data_flow_edges.push_back(edge(node(arg_idx, datautils::getvaluestaticname(arg_idx)), node(UI->get(), datautils::getvaluestaticname(UI->get()))));
-                                // }
-                            }
-                        }
-                        break;
-                    case llvm::Instruction::Store:
-                        {
-                            llvm::StoreInst* storeinst = llvm::dyn_cast<llvm::StoreInst>(II);
-                            llvm::Value* storevalptr = storeinst->getPointerOperand();
-                            llvm::Value* storeval    = storeinst->getValueOperand();
-                            data_flow_edges.push_back(edge(node(&*II, datautils::getvaluestaticname(&*II)), node(storevalptr, datautils::getvaluestaticname(storevalptr))));
-                            data_flow_edges.push_back(edge(node(storeval, datautils::getvaluestaticname(storeval)), node(&*II, datautils::getvaluestaticname(&*II))));
-                        }
-                        break;
-                    case llvm::Instruction::Load:
-                        {
-                            llvm::LoadInst* loadinst = llvm::dyn_cast<llvm::LoadInst>(II);
-                            llvm::Value* loadvalptr = loadinst->getPointerOperand();
-                            data_flow_edges.push_back(edge(node(loadvalptr, datautils::getvaluestaticname(loadvalptr)), node(&*II, datautils::getvaluestaticname(loadvalptr))));
-                        }break;
-                    default :
-                        {
-                            for(llvm::Instruction::op_iterator op = II->op_begin(), ope = II->op_end(); op != ope; ++op)
-                            {
-                                if(llvm::dyn_cast<llvm::Instruction>(*op)||llvm::dyn_cast<llvm::Argument>(*op))
-                                {
-                                    data_flow_edges.push_back(edge(node(op->get(), datautils::getvaluestaticname(op->get())), node(&*II, datautils::getvaluestaticname(&*II))));
-                                }
-                            }
-                        }break;
-                }
-
-
-                llvm::BasicBlock::iterator previous = II;
-                ++previous;
-                func_nodes_ctrl[&*FI].push_back(node(&*II, datautils::getvaluestaticname(&*II)));
-                if(previous != IE)func_edges_ctrl[&*FI].push_back(edge(node(&*II, datautils::getvaluestaticname(&*II)), node(&*previous, datautils::getvaluestaticname(&*previous))));
-
-            }
-
-            llvm::TerminatorInst* TI = BB->getTerminator();
-            for(unsigned int succ_idx  = 0, succ_num = TI->getNumSuccessors(); succ_idx != succ_num; ++succ_idx)
-            {
-                llvm::BasicBlock * Succ = TI->getSuccessor(succ_idx);
-                llvm::Value* succ_inst = &*(Succ->begin());
-                func_edges_ctrl[&*FI].push_back(edge(node(TI, datautils::getvaluestaticname(TI)), node(succ_inst, datautils::getvaluestaticname(succ_inst))));
-            }
-        }
-    }
-    std::ofstream outgraphfile("ctrl-data.dot");
-    dumpCompleteDiGraph(outgraphfile);
-    return false;
-}/*}}}*/
 
 bool datautils::DataWorker::dumpCompleteDiGraph(std::ofstream& Out){/*{{{*/
     Out << indent << "digraph \"control_and_data_flow\"{\n";
@@ -199,4 +213,10 @@ std::string datautils::DataWorker::remove_special_chars(std::string in_str)
     }
 
     return ret_val;
+}
+
+
+llvm::PreservedAnalyses datautils::DataWorkerWrapper::run(llvm::Module&M, llvm::ModuleAnalysisManager& MAM){
+	MAM.getResult<DataWorker>(M);
+	return llvm::PreservedAnalyses::all();
 }
